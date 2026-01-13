@@ -158,8 +158,9 @@ static void open_gt1_dialog() {
  * Emulator Core
  * ============================================================================ */
 
-static void run_emulator_frame() {
-    if (!state.rom_loaded || !state.emulator_running) return;
+/* Execute one frame of emulation (used by step function) */
+static void run_one_frame() {
+    if (!state.rom_loaded) return;
     
     /* Run enough cycles for ~60fps (6.25MHz / 60 = ~104166 cycles per frame) */
     const uint32_t cycles_per_frame = state.cpu.hz / 60;
@@ -191,6 +192,11 @@ static void run_emulator_frame() {
         set_status(loader_get_error(&state.loader) ? loader_get_error(&state.loader) : "Loader error");
         loader_reset(&state.loader);
     }
+}
+
+static void run_emulator_frame() {
+    if (!state.rom_loaded || !state.emulator_running) return;
+    run_one_frame();
 }
 
 static void update_screen_texture() {
@@ -355,13 +361,19 @@ static void draw_debug_window() {
         ImGui::Separator();
         
         if (ImGui::Button("Step (1 cycle)") && state.rom_loaded) {
+            if (!loader_is_active(&state.loader)) {
+                state.cpu.in_reg = state.button_state ^ 0xFF;  /* Active low */
+            }
             gigatron_tick(&state.cpu);
             vga_tick(&state.vga);
             audio_tick(&state.audio);
+            if (loader_is_active(&state.loader)) {
+                loader_tick(&state.loader);
+            }
         }
         ImGui::SameLine();
         if (ImGui::Button("Step (1 frame)") && state.rom_loaded) {
-            run_emulator_frame();
+            run_one_frame();  /* Use run_one_frame instead of run_emulator_frame to allow stepping when paused */
         }
     }
     ImGui::End();
