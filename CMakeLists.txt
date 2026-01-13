@@ -4,6 +4,8 @@ project(gigatron_emu C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
 
+option(GIGAEMU_BUILD_RAYLIB_DEMO "Build Raylib demo" ON)
+
 # Add third party libraries
 add_subdirectory(3rd_party)
 
@@ -18,3 +20,6 @@ target_include_directories(gigatron_core PUBLIC core)
 
 # frontends
 add_subdirectory(frontend/sokol_imgui)
+if (${GIGAEMU_BUILD_RAYLIB_DEMO})
+    add_subdirectory(frontend/raylib)
+endif ()
