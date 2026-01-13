@@ -9,16 +9,16 @@ add_subdirectory(3rd_party)
 
 # Gigatron emulator core library (pure C)
 add_library(gigatron_core STATIC
-    src/gigatron.c
-    src/vga.c
-    src/audio.c
-    src/loader.c
+    core/gigatron.c
+    core/vga.c
+    core/audio.c
+    core/loader.c
 )
-target_include_directories(gigatron_core PUBLIC src)
+target_include_directories(gigatron_core PUBLIC core)
 
 # Main emulator application
-add_executable(gigatron_emu src/main.cpp)
-target_link_libraries(gigatron_emu PRIVATE 
+add_executable(gigatron_sokol_imgui frontend/sokol_imgui/main.cpp)
+target_link_libraries(gigatron_sokol_imgui PRIVATE
     gigatron_core
     sokol 
     imgui 
@@ -28,11 +28,11 @@ target_link_libraries(gigatron_emu PRIVATE
 # Platform-specific settings
 if(WIN32)
     # Windows settings
-    target_compile_definitions(gigatron_emu PRIVATE _CRT_SECURE_NO_WARNINGS)
-    target_compile_options(gigatron_emu PUBLIC $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<NOT:$<COMPILE_LANGUAGE:CUDA>>>:/wd4819>)
+    target_compile_definitions(gigatron_sokol_imgui PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(gigatron_sokol_imgui PUBLIC $<$<AND:$<CXX_COMPILER_ID:MSVC>,$<NOT:$<COMPILE_LANGUAGE:CUDA>>>:/wd4819>)
 elseif(APPLE)
     # macOS settings
-    target_link_libraries(gigatron_emu PRIVATE
+    target_link_libraries(gigatron_sokol_imgui PRIVATE
         "-framework Cocoa"
         "-framework QuartzCore"
         "-framework AudioToolbox"
@@ -45,7 +45,7 @@ elseif(UNIX)
     find_package(X11 REQUIRED)
     find_package(OpenGL REQUIRED)
     find_package(ALSA REQUIRED)
-    target_link_libraries(gigatron_emu PRIVATE
+    target_link_libraries(gigatron_sokol_imgui PRIVATE
         Threads::Threads
         ${X11_LIBRARIES}
         ${X11_Xi_LIB}
@@ -61,5 +61,5 @@ endif()
 file(COPY ${CMAKE_SOURCE_DIR}/roms DESTINATION ${CMAKE_BINARY_DIR})
 
 # Install target
-install(TARGETS gigatron_emu RUNTIME DESTINATION bin)
-install(DIRECTORY roms DESTINATION share/gigatron_emu)
+install(TARGETS gigatron_sokol_imgui RUNTIME DESTINATION bin)
+install(DIRECTORY roms DESTINATION share/gigatron_sokol_imgui)
