@@ -5,6 +5,8 @@ A cross-platform emulator for the [Gigatron TTL microcomputer](https://gigatron.
 Based on https://github.com/PhilThomas/gigatron.
 You can [try it online](https://gigatron.io/emu/).
 
+You can find roms & apps at https://github.com/kervinck/gigatron-rom/
+
 ## Features
 
 - **Pure C emulator core** - Clean, portable implementation of the Gigatron CPU, VGA output, and audio
