@@ -110,14 +110,14 @@ static inline uint32_t vga_get_frame_count(const vga_t* vga) {
 
 /**
  * Convert 6-bit Gigatron color to RGBA.
- * Input: RRGGBB (2 bits each)
+ * Input: BBGGRR (2 bits each, R in low bits)
  * Output: R, G, B, A (8 bits each)
  */
 static inline void vga_color_to_rgba(uint8_t color, uint8_t* r, uint8_t* g, uint8_t* b) {
-    /* Expand 2-bit color to 8-bit by replicating bits */
-    uint8_t r2 = (color >> 4) & 0x03;
-    uint8_t g2 = (color >> 2) & 0x03;
-    uint8_t b2 = color & 0x03;
+    /* Extract 2-bit color components (BBGGRR format) */
+    uint8_t r2 = color & 0x03;          /* bit[1:0] = R */
+    uint8_t g2 = (color >> 2) & 0x03;   /* bit[3:2] = G */
+    uint8_t b2 = (color >> 4) & 0x03;   /* bit[5:4] = B */
     
     /* Map 2-bit to 8-bit: 0->0, 1->85, 2->170, 3->255 */
     *r = (r2 << 6) | (r2 << 4) | (r2 << 2) | r2;
