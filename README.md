@@ -1,5 +1,7 @@
 # Gigatron TTL Microcomputer Emulator
 
+![screenshots](screenshots/Snipaste_2026-01-13_13-02-01.png)
+
 A cross-platform emulator for the [Gigatron TTL microcomputer](https://gigatron.io/), implemented in C with a sokol + Dear ImGui frontend.
 
 Based on https://github.com/PhilThomas/gigatron.
