@@ -19,18 +19,34 @@ extern "C" {
 
 /* Loader constants */
 #define LOADER_MAX_PAYLOAD_SIZE     60
-#define LOADER_START_OF_FRAME       'L'     /* 0x4C */
-#define LOADER_INIT_CHECKSUM        'g'     /* 0x67 */
+#define LOADER_START_OF_FRAME       0x4C    /* 'L' */
+#define LOADER_INIT_CHECKSUM        0x67    /* 'g' */
 
 /* Loader states */
 typedef enum loader_state_t {
     LOADER_IDLE,            /* Not loading */
-    LOADER_RESET_WAIT,      /* Waiting for CPU reset */
+    LOADER_RESET_WAIT,      /* Waiting after CPU reset */
     LOADER_MENU_NAV,        /* Navigating to loader in menu */
+    LOADER_SYNC_FRAME,      /* Sending sync frame with bad checksum */
     LOADER_SENDING,         /* Sending GT1 data */
+    LOADER_START_CMD,       /* Sending start command */
     LOADER_COMPLETE,        /* Loading complete */
     LOADER_ERROR            /* Error occurred */
 } loader_state_t;
+
+/* Frame sending sub-states */
+typedef enum frame_state_t {
+    FRAME_WAIT_VSYNC_NEG,       /* Wait for VSYNC falling edge */
+    FRAME_WAIT_HSYNC_1,         /* Wait for first HSYNC rising edge */
+    FRAME_WAIT_HSYNC_2,         /* Wait for second HSYNC rising edge */
+    FRAME_SEND_FIRST_BYTE,      /* Sending first byte (8 bits) */
+    FRAME_SEND_LENGTH,          /* Sending length (6 bits) */
+    FRAME_SEND_ADDR_LOW,        /* Sending low address byte (8 bits) */
+    FRAME_SEND_ADDR_HIGH,       /* Sending high address byte (8 bits) */
+    FRAME_SEND_PAYLOAD,         /* Sending payload bytes */
+    FRAME_SEND_CHECKSUM,        /* Sending checksum (8 bits) */
+    FRAME_DONE                  /* Frame complete */
+} frame_state_t;
 
 /**
  * GT1 segment
@@ -64,21 +80,32 @@ typedef struct loader_t {
     /* GT1 file being loaded */
     gt1_file_t* gt1;
     
-    /* Loading progress */
+    /* Segment/frame tracking */
     uint32_t current_segment;
-    uint32_t segment_offset;
+    uint32_t segment_offset;        /* Offset within current segment */
     
     /* Frame sending state */
-    uint32_t frame_state;
-    uint32_t bit_index;
-    uint8_t checksum;
+    frame_state_t frame_state;
+    uint8_t frame_first_byte;
+    uint8_t frame_length;
+    uint16_t frame_addr;
+    uint8_t frame_payload[LOADER_MAX_PAYLOAD_SIZE];
+    uint8_t frame_checksum;
     
-    /* Timing */
+    /* Bit sending state */
+    uint8_t current_byte;           /* Byte being sent */
+    uint8_t bits_remaining;         /* Bits left to send in current byte */
+    uint8_t payload_index;          /* Current payload byte index */
+    
+    /* Timing counters */
     uint32_t vsync_count;
-    uint32_t hsync_count;
+    uint32_t button_timer;
     
-    /* Previous OUT for edge detection */
+    /* Edge detection */
     uint8_t prev_out;
+    
+    /* Checksum accumulator */
+    uint8_t checksum;
     
     /* Error message */
     const char* error_msg;

@@ -161,13 +161,19 @@ static void open_gt1_dialog() {
 static void run_emulator_frame() {
     if (!state.rom_loaded || !state.emulator_running) return;
     
-    /* Update input */
-    state.cpu.in_reg = state.button_state ^ 0xFF;  /* Active low */
-    
     /* Run enough cycles for ~60fps (6.25MHz / 60 = ~104166 cycles per frame) */
     const uint32_t cycles_per_frame = state.cpu.hz / 60;
     
     for (uint32_t i = 0; i < cycles_per_frame; i++) {
+        /* 
+         * IMPORTANT: Only update input from user when loader is not active!
+         * The loader controls in_reg to send data bits via the serial protocol.
+         * This matches jsemu behavior where gamepad.stop() is called during loading.
+         */
+        if (!loader_is_active(&state.loader)) {
+            state.cpu.in_reg = state.button_state ^ 0xFF;  /* Active low */
+        }
+        
         gigatron_tick(&state.cpu);
         vga_tick(&state.vga);
         audio_tick(&state.audio);

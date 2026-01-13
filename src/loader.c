@@ -1,8 +1,14 @@
 /**
  * Gigatron GT1 File Loader
  * 
- * The GT1 loader simulates the serial loading process used by the real
- * Gigatron to receive programs through the controller port.
+ * Implements the GT1 serial loading protocol exactly as jsemu does.
+ * Data is sent bit by bit through the input register, synchronized
+ * with HSYNC pulses.
+ * 
+ * Key details from jsemu:
+ * 1. Shift bit FIRST, then wait for HSYNC posedge
+ * 2. Checksum accumulates across frames (not reset per frame)
+ * 3. After sending checksum, update checksum = (-checksum) & 0xFF
  */
 
 #include "loader.h"
@@ -10,20 +16,12 @@
 #include <string.h>
 #include <stdio.h>
 
-/* Internal frame sending states */
-enum {
-    FRAME_IDLE,
-    FRAME_WAIT_VSYNC_NEG,
-    FRAME_WAIT_HSYNC_POS_1,
-    FRAME_WAIT_HSYNC_POS_2,
-    FRAME_SEND_FIRST_BYTE,
-    FRAME_SEND_LENGTH,
-    FRAME_SEND_ADDR_LOW,
-    FRAME_SEND_ADDR_HIGH,
-    FRAME_SEND_PAYLOAD,
-    FRAME_SEND_CHECKSUM,
-    FRAME_DONE
-};
+/* Button press timing (in VSYNC frames) */
+#define BUTTON_DOWN_TIME    1
+#define BUTTON_UP_TIME      1
+#define BUTTON_A_UP_TIME    60
+#define RESET_WAIT_FRAMES   100
+#define MENU_DOWN_PRESSES   5
 
 /**
  * Initialize loader
@@ -64,23 +62,21 @@ void loader_reset(loader_t* loader) {
     loader->state = LOADER_IDLE;
     loader->current_segment = 0;
     loader->segment_offset = 0;
-    loader->frame_state = FRAME_IDLE;
-    loader->bit_index = 0;
+    loader->frame_state = FRAME_WAIT_VSYNC_NEG;
+    loader->bits_remaining = 0;
     loader->checksum = 0;
     loader->vsync_count = 0;
-    loader->hsync_count = 0;
+    loader->button_timer = 0;
     loader->prev_out = 0;
     loader->error_msg = NULL;
+    
+    if (loader->cpu) {
+        loader->cpu->in_reg = 0xFF;
+    }
 }
 
 /**
  * Parse GT1 file from memory
- * 
- * GT1 format:
- * - Segments: [high_addr][low_addr][size][data...]
- *   - size=0 means 256 bytes
- * - End marker: [0x00][high_start][low_start]
- *   - If start_addr is 0, execution continues at vCPU
  */
 gt1_file_t* loader_parse_gt1(const uint8_t* data, size_t size) {
     if (!data || size < 3) return NULL;
@@ -94,7 +90,6 @@ gt1_file_t* loader_parse_gt1(const uint8_t* data, size_t size) {
     
     while (offset < size) {
         if (data[offset] == 0x00 && offset > 0) {
-            /* End marker */
             break;
         }
         
@@ -103,7 +98,6 @@ gt1_file_t* loader_parse_gt1(const uint8_t* data, size_t size) {
             return NULL;
         }
         
-        /* uint16_t addr = ((uint16_t)data[offset] << 8) | data[offset + 1]; */
         offset += 2;
         
         uint16_t seg_size = data[offset];
@@ -244,10 +238,12 @@ bool loader_start(loader_t* loader, gt1_file_t* gt1) {
     loader->gt1 = gt1;
     loader->current_segment = 0;
     loader->segment_offset = 0;
-    loader->frame_state = FRAME_IDLE;
-    loader->bit_index = 0;
+    loader->frame_state = FRAME_WAIT_VSYNC_NEG;
+    loader->bits_remaining = 0;
     loader->vsync_count = 0;
-    loader->hsync_count = 0;
+    loader->button_timer = 0;
+    loader->checksum = 0;
+    loader->prev_out = loader->cpu->out;
     loader->error_msg = NULL;
     
     /* Start by resetting the CPU */
@@ -255,13 +251,6 @@ bool loader_start(loader_t* loader, gt1_file_t* gt1) {
     loader->state = LOADER_RESET_WAIT;
     
     return true;
-}
-
-/**
- * Shift one bit into the input register
- */
-static void shift_bit(loader_t* loader, uint8_t bit) {
-    loader->cpu->in_reg = ((loader->cpu->in_reg << 1) & 0xFF) | (bit ? 1 : 0);
 }
 
 /**
@@ -280,7 +269,6 @@ float loader_get_progress(const loader_t* loader) {
         return 0.0f;
     }
     
-    /* Calculate total bytes and bytes sent */
     uint32_t total_bytes = 0;
     uint32_t sent_bytes = 0;
     
@@ -297,122 +285,414 @@ float loader_get_progress(const loader_t* loader) {
 }
 
 /**
- * Check for positive edge of signal
+ * Check for VSYNC rising edge (signal goes high)
  */
-static bool posedge(loader_t* loader, uint8_t mask) {
-    return (~loader->prev_out & loader->cpu->out & mask) != 0;
+static bool vsync_posedge(loader_t* loader) {
+    return (~loader->prev_out & loader->cpu->out & GIGATRON_OUT_VSYNC) != 0;
 }
 
 /**
- * Check for negative edge of signal
+ * Check for VSYNC falling edge (signal goes low)
  */
-static bool negedge(loader_t* loader, uint8_t mask) {
-    return (loader->prev_out & ~loader->cpu->out & mask) != 0;
+static bool vsync_negedge(loader_t* loader) {
+    return (loader->prev_out & ~loader->cpu->out & GIGATRON_OUT_VSYNC) != 0;
+}
+
+/**
+ * Check for HSYNC rising edge (signal goes high)
+ */
+static bool hsync_posedge(loader_t* loader) {
+    return (~loader->prev_out & loader->cpu->out & GIGATRON_OUT_HSYNC) != 0;
+}
+
+/**
+ * Shift one bit into input register (MSB first)
+ * This is called BEFORE waiting for HSYNC, matching JS behavior
+ */
+static void shift_bit(loader_t* loader, bool bit) {
+    loader->cpu->in_reg = ((loader->cpu->in_reg << 1) & 0xFF) | (bit ? 1 : 0);
+}
+
+/**
+ * Prepare a frame for sending
+ * Note: Does NOT reset checksum - caller is responsible for that
+ */
+static void prepare_frame(loader_t* loader, uint8_t first_byte, uint16_t addr, 
+                          const uint8_t* payload, uint8_t payload_len) {
+    loader->frame_first_byte = first_byte;
+    loader->frame_length = payload_len;
+    loader->frame_addr = addr;
+    
+    /* Clear and copy payload */
+    memset(loader->frame_payload, 0, LOADER_MAX_PAYLOAD_SIZE);
+    if (payload && payload_len > 0) {
+        memcpy(loader->frame_payload, payload, payload_len);
+    }
+    
+    loader->frame_state = FRAME_WAIT_VSYNC_NEG;
+    loader->bits_remaining = 0;
+    loader->payload_index = 0;
+}
+
+/**
+ * Process frame sending state machine
+ * 
+ * Critical timing from JS:
+ *   shiftBit(bit);           // shift FIRST
+ *   await atPosedge(HSYNC);  // then wait
+ * 
+ * Checksum flow from JS:
+ *   - sendDataBits adds value to checksum, then sends bits
+ *   - After firstByte, add (firstByte << 6) to checksum
+ *   - At end, checksum = (-checksum) & 0xFF, send that, and KEEP that value
+ * 
+ * Returns true when frame is complete
+ */
+static bool process_frame(loader_t* loader) {
+    switch (loader->frame_state) {
+        case FRAME_WAIT_VSYNC_NEG:
+            /* Wait for VSYNC falling edge to start frame */
+            if (vsync_negedge(loader)) {
+                loader->frame_state = FRAME_WAIT_HSYNC_1;
+            }
+            break;
+            
+        case FRAME_WAIT_HSYNC_1:
+            /* Wait for first HSYNC posedge */
+            if (hsync_posedge(loader)) {
+                loader->frame_state = FRAME_WAIT_HSYNC_2;
+            }
+            break;
+            
+        case FRAME_WAIT_HSYNC_2:
+            /* Wait for second HSYNC posedge, then start sending */
+            if (hsync_posedge(loader)) {
+                /* sendDataBits(firstByte, 8): add to checksum, then send */
+                loader->checksum = (loader->checksum + loader->frame_first_byte) & 0xFF;
+                loader->current_byte = loader->frame_first_byte;
+                loader->bits_remaining = 8;
+                
+                /* Shift first bit (MSB) - shift BEFORE waiting for next HSYNC */
+                shift_bit(loader, (loader->current_byte & 0x80) != 0);
+                loader->current_byte <<= 1;
+                loader->bits_remaining--;
+                
+                loader->frame_state = FRAME_SEND_FIRST_BYTE;
+            }
+            break;
+            
+        case FRAME_SEND_FIRST_BYTE:
+            /* Sending first byte bits */
+            if (hsync_posedge(loader)) {
+                if (loader->bits_remaining > 0) {
+                    shift_bit(loader, (loader->current_byte & 0x80) != 0);
+                    loader->current_byte <<= 1;
+                    loader->bits_remaining--;
+                } else {
+                    /* First byte done */
+                    /* Add (firstByte << 6) to checksum - this is per JS protocol */
+                    loader->checksum = (loader->checksum + (loader->frame_first_byte << 6)) & 0xFF;
+                    
+                    /* sendDataBits(length, 6): add to checksum, then send */
+                    loader->checksum = (loader->checksum + loader->frame_length) & 0xFF;
+                    loader->current_byte = loader->frame_length << 2; /* Align to MSB for 6-bit */
+                    loader->bits_remaining = 6;
+                    
+                    shift_bit(loader, (loader->current_byte & 0x80) != 0);
+                    loader->current_byte <<= 1;
+                    loader->bits_remaining--;
+                    
+                    loader->frame_state = FRAME_SEND_LENGTH;
+                }
+            }
+            break;
+            
+        case FRAME_SEND_LENGTH:
+            /* Sending length bits */
+            if (hsync_posedge(loader)) {
+                if (loader->bits_remaining > 0) {
+                    shift_bit(loader, (loader->current_byte & 0x80) != 0);
+                    loader->current_byte <<= 1;
+                    loader->bits_remaining--;
+                } else {
+                    /* sendDataBits(addr & 0xff, 8) */
+                    uint8_t addr_low = loader->frame_addr & 0xFF;
+                    loader->checksum = (loader->checksum + addr_low) & 0xFF;
+                    loader->current_byte = addr_low;
+                    loader->bits_remaining = 8;
+                    
+                    shift_bit(loader, (loader->current_byte & 0x80) != 0);
+                    loader->current_byte <<= 1;
+                    loader->bits_remaining--;
+                    
+                    loader->frame_state = FRAME_SEND_ADDR_LOW;
+                }
+            }
+            break;
+            
+        case FRAME_SEND_ADDR_LOW:
+            /* Sending addr low bits */
+            if (hsync_posedge(loader)) {
+                if (loader->bits_remaining > 0) {
+                    shift_bit(loader, (loader->current_byte & 0x80) != 0);
+                    loader->current_byte <<= 1;
+                    loader->bits_remaining--;
+                } else {
+                    /* sendDataBits(addr >> 8, 8) */
+                    uint8_t addr_high = (loader->frame_addr >> 8) & 0xFF;
+                    loader->checksum = (loader->checksum + addr_high) & 0xFF;
+                    loader->current_byte = addr_high;
+                    loader->bits_remaining = 8;
+                    
+                    shift_bit(loader, (loader->current_byte & 0x80) != 0);
+                    loader->current_byte <<= 1;
+                    loader->bits_remaining--;
+                    
+                    loader->frame_state = FRAME_SEND_ADDR_HIGH;
+                }
+            }
+            break;
+            
+        case FRAME_SEND_ADDR_HIGH:
+            /* Sending addr high bits */
+            if (hsync_posedge(loader)) {
+                if (loader->bits_remaining > 0) {
+                    shift_bit(loader, (loader->current_byte & 0x80) != 0);
+                    loader->current_byte <<= 1;
+                    loader->bits_remaining--;
+                } else {
+                    /* sendDataBytes: send 60 bytes (payload padded with zeros) */
+                    loader->payload_index = 0;
+                    uint8_t byte = loader->frame_payload[0];
+                    loader->checksum = (loader->checksum + byte) & 0xFF;
+                    loader->current_byte = byte;
+                    loader->bits_remaining = 8;
+                    
+                    shift_bit(loader, (loader->current_byte & 0x80) != 0);
+                    loader->current_byte <<= 1;
+                    loader->bits_remaining--;
+                    
+                    loader->frame_state = FRAME_SEND_PAYLOAD;
+                }
+            }
+            break;
+            
+        case FRAME_SEND_PAYLOAD:
+            /* Sending payload bytes */
+            if (hsync_posedge(loader)) {
+                if (loader->bits_remaining > 0) {
+                    shift_bit(loader, (loader->current_byte & 0x80) != 0);
+                    loader->current_byte <<= 1;
+                    loader->bits_remaining--;
+                } else {
+                    /* Current byte done */
+                    loader->payload_index++;
+                    
+                    if (loader->payload_index >= LOADER_MAX_PAYLOAD_SIZE) {
+                        /* All 60 payload bytes sent */
+                        /* Calculate final checksum and UPDATE loader->checksum */
+                        /* JS: this.checksum = (-this.checksum) & 0xff; */
+                        loader->checksum = (-loader->checksum) & 0xFF;
+                        
+                        /* sendBits(checksum, 8) - does NOT add to checksum */
+                        loader->current_byte = loader->checksum;
+                        loader->bits_remaining = 8;
+                        
+                        shift_bit(loader, (loader->current_byte & 0x80) != 0);
+                        loader->current_byte <<= 1;
+                        loader->bits_remaining--;
+                        
+                        loader->frame_state = FRAME_SEND_CHECKSUM;
+                    } else {
+                        /* Send next payload byte (sendDataBits adds to checksum) */
+                        uint8_t byte = loader->frame_payload[loader->payload_index];
+                        loader->checksum = (loader->checksum + byte) & 0xFF;
+                        loader->current_byte = byte;
+                        loader->bits_remaining = 8;
+                        
+                        shift_bit(loader, (loader->current_byte & 0x80) != 0);
+                        loader->current_byte <<= 1;
+                        loader->bits_remaining--;
+                    }
+                }
+            }
+            break;
+            
+        case FRAME_SEND_CHECKSUM:
+            /* Sending checksum bits */
+            if (hsync_posedge(loader)) {
+                if (loader->bits_remaining > 0) {
+                    shift_bit(loader, (loader->current_byte & 0x80) != 0);
+                    loader->current_byte <<= 1;
+                    loader->bits_remaining--;
+                } else {
+                    /* Frame complete - checksum already updated to final value */
+                    loader->frame_state = FRAME_DONE;
+                    return true;
+                }
+            }
+            break;
+            
+        case FRAME_DONE:
+            return true;
+    }
+    
+    return false;
+}
+
+/**
+ * Setup next data frame from GT1 segments
+ * Note: Does NOT reset checksum - checksum accumulates across frames per JS behavior
+ * Returns false if no more data to send
+ */
+static bool setup_next_data_frame(loader_t* loader) {
+    if (!loader->gt1) return false;
+    
+    while (loader->current_segment < loader->gt1->num_segments) {
+        gt1_segment_t* seg = &loader->gt1->segments[loader->current_segment];
+        
+        if (loader->segment_offset < seg->size) {
+            /* Calculate how many bytes to send in this frame */
+            uint16_t remaining = seg->size - loader->segment_offset;
+            uint8_t frame_len = (remaining > LOADER_MAX_PAYLOAD_SIZE) ? 
+                                LOADER_MAX_PAYLOAD_SIZE : (uint8_t)remaining;
+            
+            /* Get address for this chunk */
+            uint16_t addr = seg->address + loader->segment_offset;
+            
+            /* Prepare the frame - checksum continues from previous frame */
+            prepare_frame(loader, LOADER_START_OF_FRAME, addr,
+                         seg->data + loader->segment_offset, frame_len);
+            
+            loader->segment_offset += frame_len;
+            return true;
+        }
+        
+        /* Move to next segment */
+        loader->current_segment++;
+        loader->segment_offset = 0;
+    }
+    
+    return false;
 }
 
 /**
  * Advance loader by one tick
- * 
- * This implements a simplified version of the loading protocol.
- * The real protocol is quite complex with precise timing requirements.
- * This version uses a simpler state machine approach.
  */
 void loader_tick(loader_t* loader) {
     if (!loader || !loader->cpu) return;
     
-    uint8_t out = loader->cpu->out;
-    
-    /* Handle different loader states */
     switch (loader->state) {
         case LOADER_IDLE:
         case LOADER_COMPLETE:
         case LOADER_ERROR:
-            /* Nothing to do */
             break;
             
         case LOADER_RESET_WAIT:
-            /* Wait for some VSYNCs after reset */
-            if (negedge(loader, GIGATRON_OUT_VSYNC)) {
+            /* Wait for RESET_WAIT_FRAMES VSYNCs after reset */
+            if (vsync_posedge(loader)) {
                 loader->vsync_count++;
-                if (loader->vsync_count >= 100) {
+                if (loader->vsync_count >= RESET_WAIT_FRAMES) {
                     loader->state = LOADER_MENU_NAV;
                     loader->vsync_count = 0;
+                    loader->button_timer = 0;
                 }
             }
             break;
             
         case LOADER_MENU_NAV:
-            /* Navigate to loader in menu */
-            /* Press DOWN 5 times, then A */
-            if (negedge(loader, GIGATRON_OUT_VSYNC)) {
+            /* Navigate menu: press DOWN 5 times, then A once */
+            if (vsync_posedge(loader)) {
                 loader->vsync_count++;
                 
-                if (loader->vsync_count <= 5) {
-                    /* Press DOWN */
-                    loader->cpu->in_reg = GIGATRON_BTN_DOWN ^ 0xFF;
-                } else if (loader->vsync_count <= 6) {
-                    /* Release */
-                    loader->cpu->in_reg = 0xFF;
-                } else if (loader->vsync_count <= 10) {
-                    /* More DOWNs with releases */
+                /* 
+                 * JS: replicate(5, this.pressButton(BUTTON_DOWN, 1, 1))
+                 * Each button press: 1 frame down, 1 frame up = 2 frames per press
+                 * 5 presses = 10 frames
+                 * 
+                 * JS: this.pressButton(BUTTON_A, 1, 60)
+                 * 1 frame down, 60 frames up = 61 frames
+                 * 
+                 * Total: 10 + 61 = 71 frames before starting to send
+                 */
+                
+                if (loader->vsync_count <= MENU_DOWN_PRESSES * 2) {
+                    /* DOWN button presses (frames 1-10) */
                     if (loader->vsync_count % 2 == 1) {
+                        /* Odd frames: press DOWN */
                         loader->cpu->in_reg = GIGATRON_BTN_DOWN ^ 0xFF;
                     } else {
+                        /* Even frames: release */
                         loader->cpu->in_reg = 0xFF;
                     }
-                } else if (loader->vsync_count == 11) {
-                    /* Press A */
+                } else if (loader->vsync_count == MENU_DOWN_PRESSES * 2 + 1) {
+                    /* Frame 11: Press A */
                     loader->cpu->in_reg = GIGATRON_BTN_A ^ 0xFF;
-                } else if (loader->vsync_count == 12) {
-                    /* Release A */
+                } else if (loader->vsync_count == MENU_DOWN_PRESSES * 2 + 2) {
+                    /* Frame 12: Release A */
                     loader->cpu->in_reg = 0xFF;
-                } else if (loader->vsync_count >= 72) {
-                    /* Wait for loader to be ready, then start sending */
-                    loader->state = LOADER_SENDING;
-                    loader->vsync_count = 0;
-                    loader->hsync_count = 0;
-                    loader->frame_state = FRAME_IDLE;
+                } else if (loader->vsync_count >= MENU_DOWN_PRESSES * 2 + 2 + BUTTON_A_UP_TIME) {
+                    /* Frame 72: Done with menu navigation, start sync frame */
+                    /* JS: this.checksum = 0; return this.sendFrame(0xff, 0); */
+                    loader->state = LOADER_SYNC_FRAME;
                     loader->checksum = 0;
-                    
-                    /* Send initial frame with bad checksum to resync */
-                    loader->current_segment = 0;
-                    loader->segment_offset = 0;
+                    prepare_frame(loader, 0xFF, 0, NULL, 0);
+                }
+            }
+            break;
+            
+        case LOADER_SYNC_FRAME:
+            /* Send sync frame with checksum starting from 0 (intentionally bad) */
+            if (process_frame(loader)) {
+                /* Sync frame done */
+                /* JS: this.checksum = INIT_CHECKSUM; return this.sendSegments(data); */
+                loader->checksum = LOADER_INIT_CHECKSUM;
+                loader->state = LOADER_SENDING;
+                loader->current_segment = 0;
+                loader->segment_offset = 0;
+                
+                if (!setup_next_data_frame(loader)) {
+                    /* No data to send, go to start command */
+                    if (loader->gt1->has_start_address) {
+                        loader->state = LOADER_START_CMD;
+                        /* Checksum continues from INIT_CHECKSUM */
+                        prepare_frame(loader, LOADER_START_OF_FRAME, 
+                                     loader->gt1->start_address, NULL, 0);
+                    } else {
+                        loader->state = LOADER_COMPLETE;
+                        loader->cpu->in_reg = 0xFF;
+                    }
                 }
             }
             break;
             
         case LOADER_SENDING:
-            /* Send GT1 data frame by frame */
-            /* This is a simplified implementation - the real one is more complex */
-            
-            /* For simplicity, we directly write to RAM instead of going through
-             * the full serial protocol. This is a common approach in emulators. */
-            if (loader->gt1) {
-                /* Direct load into RAM */
-                for (uint32_t i = 0; i < loader->gt1->num_segments; i++) {
-                    gt1_segment_t* seg = &loader->gt1->segments[i];
-                    for (uint16_t j = 0; j < seg->size; j++) {
-                        uint16_t addr = (seg->address + j) & loader->cpu->ram_mask;
-                        loader->cpu->ram[addr] = seg->data[j];
+            /* Send GT1 data frames - checksum accumulates across frames */
+            if (process_frame(loader)) {
+                /* Frame done, prepare next (checksum continues) */
+                if (!setup_next_data_frame(loader)) {
+                    /* All data sent, send start command if needed */
+                    if (loader->gt1->has_start_address) {
+                        loader->state = LOADER_START_CMD;
+                        /* Checksum continues from current value */
+                        prepare_frame(loader, LOADER_START_OF_FRAME,
+                                     loader->gt1->start_address, NULL, 0);
+                    } else {
+                        loader->state = LOADER_COMPLETE;
+                        loader->cpu->in_reg = 0xFF;
                     }
                 }
-                
-                /* Set start address if specified */
-                if (loader->gt1->has_start_address) {
-                    /* The vCPU start address is stored at 0x0016-0x0017 (vPC) */
-                    uint16_t start = loader->gt1->start_address;
-                    loader->cpu->ram[0x16] = start & 0xFF;
-                    loader->cpu->ram[0x17] = (start >> 8) & 0xFF;
-                }
-                
+            }
+            break;
+            
+        case LOADER_START_CMD:
+            /* Send start command frame - checksum continues from data frames */
+            if (process_frame(loader)) {
                 loader->state = LOADER_COMPLETE;
-                loader->cpu->in_reg = 0xFF;  /* Release all buttons */
-            } else {
-                loader->state = LOADER_ERROR;
-                loader->error_msg = "No GT1 data";
+                loader->cpu->in_reg = 0xFF;
             }
             break;
     }
     
-    loader->prev_out = out;
+    loader->prev_out = loader->cpu->out;
 }
