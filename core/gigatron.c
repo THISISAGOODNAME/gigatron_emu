@@ -54,12 +54,13 @@
 
 /**
  * Get default configuration
+ * Note: Default RAM is 128KB (17-bit address) to support extended ROMs like dev128k7.rom
  */
 gigatron_config_t gigatron_default_config(void) {
     gigatron_config_t config = {
         .hz = GIGATRON_HZ,
         .rom_address_width = 16,
-        .ram_address_width = 15
+        .ram_address_width = 17  /* 128KB for extended ROM support */
     };
     return config;
 }
@@ -143,6 +144,13 @@ void gigatron_reset(gigatron_t* cpu) {
     cpu->out = 0;
     cpu->outx = 0;
     cpu->in_reg = 0xFF;     /* Active low - all buttons released */
+    
+    /* 128K+ expansion registers */
+    cpu->ctrl = 0x7C;       /* Default CTRL value */
+    cpu->bank = 0;          /* Default bank (no offset) */
+    cpu->prev_ctrl = -1;    /* No previous CTRL */
+    cpu->miso = 0;          /* SPI MISO */
+    
     cpu->cycles = 0;
 }
 
@@ -192,6 +200,19 @@ static inline uint8_t calc_offset(gigatron_t* cpu, uint8_t bus, uint8_t d) {
 }
 
 /**
+ * Translate RAM address for 128K+ expansion (bank switching)
+ */
+static inline uint32_t translate_ram_addr(gigatron_t* cpu, uint16_t addr) {
+    /* Convert to 32-bit to avoid truncation when XORing with bank */
+    uint32_t phys_addr = addr;
+    /* If address bit 15 is set, XOR with bank value */
+    if (phys_addr & 0x8000) {
+        phys_addr ^= cpu->bank;
+    }
+    return phys_addr & cpu->ram_mask;
+}
+
+/**
  * Execute ALU operation (OP 0-5)
  */
 static void exec_alu_op(gigatron_t* cpu, uint8_t op, uint8_t mode, uint8_t bus, uint8_t d) {
@@ -203,8 +224,14 @@ static void exec_alu_op(gigatron_t* cpu, uint8_t op, uint8_t mode, uint8_t bus, 
             b = d;
             break;
         case BUS_RAM: {
-            uint16_t addr = calc_addr(cpu, mode, d) & cpu->ram_mask;
-            b = cpu->ram[addr];
+            uint16_t addr = calc_addr(cpu, mode, d);
+            /* 128K+ expansion: SPI mode check */
+            if (cpu->ctrl & 1) {
+                b = cpu->miso;  /* SPI MISO data */
+            } else {
+                uint32_t phys_addr = translate_ram_addr(cpu, addr);
+                b = cpu->ram[phys_addr];
+            }
             break;
         }
         case BUS_AC:
@@ -272,7 +299,9 @@ static void exec_alu_op(gigatron_t* cpu, uint8_t op, uint8_t mode, uint8_t bus, 
  * Execute store operation (OP 6)
  */
 static void exec_store_op(gigatron_t* cpu, uint8_t mode, uint8_t bus, uint8_t d) {
-    uint8_t b;
+    uint8_t b = 0;
+    bool do_write = true;
+    uint16_t addr = calc_addr(cpu, mode, d);
     
     /* Get value to store */
     switch (bus) {
@@ -280,8 +309,18 @@ static void exec_store_op(gigatron_t* cpu, uint8_t mode, uint8_t bus, uint8_t d)
             b = d;
             break;
         case BUS_RAM:
-            /* Undefined behavior in original - we use 0 */
-            b = 0;
+            /* 128K+ expansion: ST [Y,X++],$xx becomes CTRL register write */
+            if (cpu->ram_size > 65536) {
+                /* Write to CTRL register instead of RAM */
+                cpu->prev_ctrl = cpu->ctrl;
+                cpu->ctrl = addr & 0x80FD;
+                /* Calculate bank: ((ctrl & 0xC0) << 9) ^ 0x8000 */
+                cpu->bank = ((cpu->ctrl & 0xC0) << 9) ^ 0x8000;
+                do_write = false;  /* Don't write to RAM */
+            } else {
+                /* Original undefined behavior - use 0 */
+                b = 0;
+            }
             break;
         case BUS_AC:
             b = cpu->ac;
@@ -294,17 +333,19 @@ static void exec_store_op(gigatron_t* cpu, uint8_t mode, uint8_t bus, uint8_t d)
             break;
     }
     
-    /* Calculate address and store */
-    uint16_t addr = calc_addr(cpu, mode, d) & cpu->ram_mask;
-    cpu->ram[addr] = b;
+    /* Write to RAM if not CTRL write */
+    if (do_write) {
+        uint32_t phys_addr = translate_ram_addr(cpu, addr);
+        cpu->ram[phys_addr] = b;
+    }
     
     /* Some modes also write to a register */
     switch (mode) {
         case MODE_D_X:
-            cpu->x = b;
+            cpu->x = cpu->ac;  /* Note: writes AC, not b */
             break;
         case MODE_D_Y:
-            cpu->y = b;
+            cpu->y = cpu->ac;  /* Note: writes AC, not b */
             break;
     }
 }
@@ -362,6 +403,9 @@ static void exec_branch_op(gigatron_t* cpu, uint8_t mode, uint8_t bus, uint8_t d
  */
 void gigatron_tick(gigatron_t* cpu) {
     if (!cpu || !cpu->rom) return;
+    
+    /* Reset prev_ctrl at start of each tick */
+    cpu->prev_ctrl = -1;
     
     /* Fetch instruction */
     uint16_t pc = cpu->pc;

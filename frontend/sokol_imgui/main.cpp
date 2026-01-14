@@ -355,6 +355,8 @@ static void draw_debug_window() {
         ImGui::Text("FPS: %.1f", state.frame_time_ms > 0 ? 1000.0 / state.frame_time_ms : 0);
         ImGui::Text("VGA Frames: %u", state.vga.frame_count);
         ImGui::Text("CPU Cycles: %llu", (unsigned long long)state.cpu.cycles);
+        ImGui::Text("RAM: %uKB (bank=0x%05X, ctrl=0x%02X)", 
+                    state.cpu.ram_size / 1024, state.cpu.bank, state.cpu.ctrl);
         ImGui::Separator();
         ImGui::Text("Audio Samples: %u", audio_available_samples(&state.audio));
         ImGui::Text("Loader State: %d", state.loader.state);

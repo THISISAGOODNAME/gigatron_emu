@@ -62,6 +62,12 @@ typedef struct gigatron_t {
     uint8_t outx;       /* Extended output register (active low audio sample) */
     uint8_t in_reg;     /* Input register (directly from controller, directly active low) */
     
+    /* 128K+ expansion support (bank switching) */
+    uint16_t ctrl;      /* CTRL register for bank switching and SPI */
+    uint32_t bank;      /* Current bank offset for address translation */
+    int16_t prev_ctrl;  /* Previous CTRL value (-1 if not set this tick) */
+    uint8_t miso;       /* SPI MISO signal */
+    
     /* Cycle counter for timing */
     uint64_t cycles;
 } gigatron_t;
